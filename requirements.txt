@@ -5,3 +5,5 @@ python-dotenv
 urllib3
 google-generativeai
 beautifulsoup4
+flask
+flask-cors

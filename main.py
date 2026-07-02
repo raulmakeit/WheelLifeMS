@@ -33,7 +33,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY or "your-project-id" in SUPABASE_URL:
-    print("Error: Configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en el archivo .env de WheelLifeRSS.")
+    print("Error: Configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en el archivo .env de WheelLifeMS.")
     sys.exit(1)
 
 if not GEMINI_API_KEY or "tu_clave" in GEMINI_API_KEY:
@@ -196,8 +196,12 @@ def init_interests():
     except Exception as e:
         print(f"Error al verificar/inicializar intereses: {e}")
 
+# Global para capturar errores de cuota o scraping
+last_error_msg = ""
+
 def fetch_book_summaries(interest_id, label):
     """Busca libros usando Google Books API y genera un resumen estructurado con Gemini AI."""
+    global last_error_msg
     print(f"  Buscando libros sobre: {label}")
     try:
         # 1. Consultar títulos ya existentes en Supabase para evitar duplicados
@@ -432,6 +436,7 @@ def fetch_book_summaries(interest_id, label):
         print(f"    [+] Libro guardado con resumen IA: {title}")
             
     except Exception as e:
+        last_error_msg = str(e)
         print(f"    Error buscando/resumiendo libros para {label}: {e}")
 
 def fetch_wikipedia_people(interest_id, label):
@@ -645,96 +650,116 @@ def fetch_rss_and_devto_articles(interest_id, label, area_id):
         except Exception as e:
             print(f"    Error procesando artículo {cand['url']}: {e}")
 
-def main():
+def run_gather(limit=3, interest_ids=None):
+    global last_error_msg
+    last_error_msg = ""
     print("="*60)
     print("WHEELLIFE RSS - RECOLECTOR DE CONTENIDOS CON GEMINI AI")
     print("="*60)
-    
-    # 1. Procesar argumentos de línea de comandos
+    try:
+        init_interests()
+        
+        try:
+            res = supabase.table("interests").select("*").execute()
+            interests = res.data
+            print(f"Cargados {len(interests)} intereses globales.")
+        except Exception as e:
+            print(f"Error cargando intereses de Supabase: {e}")
+            return
+
+        # 2. Filtrar intereses según argumentos
+        if interest_ids:
+            selected_ids = [x.strip() for x in interest_ids.split(",") if x.strip()]
+            interests = [i for i in interests if i["id"] in selected_ids]
+            print(f"Filtrado a {len(interests)} intereses especificados: {selected_ids}")
+            if len(interests) == 0:
+                print("Ninguno de los intereses especificados coincide con los cargados de Supabase.")
+                return
+        else:
+            import random
+            random.shuffle(interests)
+            print(f"Sin intereses específicos solicitados. Procesando aleatoriamente.")
+
+        print(f"\nIniciando recolección de contenido (límite: {limit} libros/resúmenes)...")
+        books_generated = 0
+        max_attempts = limit * 3  # Previene bucles infinitos si hay errores repetidos o no hay más libros
+        attempts = 0
+        interest_index = 0
+        
+        if not interests:
+            print("No hay intereses para procesar.")
+            return
+            
+        while books_generated < limit and attempts < max_attempts:
+            interest = interests[interest_index % len(interests)]
+            interest_id = interest["id"]
+            label = interest["label"]
+            area_id = interest["area_id"]
+            
+            print(f"\n[*] Procesando [{interest_id}] {label} ({area_id}) - Intento {attempts + 1}")
+            
+            # Consultar cuántos libros hay antes de buscar
+            try:
+                res_before = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
+                count_before = res_before.count if res_before.count is not None else 0
+            except Exception:
+                count_before = 0
+                
+            # 1. Buscar libro
+            fetch_book_summaries(interest_id, label)
+            
+            # Consultar cuántos libros hay después de buscar para verificar si se añadió uno nuevo
+            try:
+                res_after = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
+                count_after = res_after.count if res_after.count is not None else 0
+            except Exception:
+                count_after = 0
+                
+            if count_after > count_before:
+                books_generated += 1
+                print(f"    -> Libro generado con éxito ({books_generated}/{limit})")
+            else:
+                print("    -> No se generó ningún libro nuevo (posible duplicado o límite alcanzado).")
+                
+            # 2. Buscar personaje (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
+            if attempts < len(interests):
+                fetch_wikipedia_people(interest_id, label)
+            
+            # 3. Buscar artículos (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
+            if attempts < len(interests):
+                fetch_rss_and_devto_articles(interest_id, label, area_id)
+                
+            interest_index += 1
+            attempts += 1
+            
+        print("\n" + "="*60)
+        print(f"¡Recolección completada! Libros generados: {books_generated}/{limit} en {attempts} intentos.")
+        print("="*60)
+    finally:
+        try:
+            if books_generated == 0 and last_error_msg:
+                if "429" in last_error_msg or "Quota exceeded" in last_error_msg:
+                    friendly_error = "Se ha superado el límite de uso de la Inteligencia Artificial. Por favor, espera aproximadamente un minuto e inténtalo de nuevo."
+                elif "Max retries exceeded" in last_error_msg:
+                    friendly_error = "Error de conexión. No se pudo conectar con los servicios externos de búsqueda."
+                else:
+                    friendly_error = "Ocurrió un error inesperado generando el resumen. Inténtalo de nuevo más tarde."
+                final_result = f"Error: {friendly_error}"
+            else:
+                final_result = f"Éxito: Se generaron {books_generated} libros."
+                
+            supabase.table("system_settings").upsert({"key": "scraping_last_error", "value": final_result}).execute()
+            supabase.table("system_settings").upsert({"key": "scraping_status", "value": "idle"}).execute()
+        except Exception as e:
+            print(f"Error actualizando status a idle: {e}")
+
+def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--limit', type=int, default=3, help="Límite de libros a generar en total")
     parser.add_argument('--interests', type=str, default=None, help="Lista de IDs de intereses separados por coma")
     args = parser.parse_args()
-    
-    init_interests()
-    
-    try:
-        res = supabase.table("interests").select("*").execute()
-        interests = res.data
-        print(f"Cargados {len(interests)} intereses globales.")
-    except Exception as e:
-        print(f"Error cargando intereses de Supabase: {e}")
-        return
-
-    # 2. Filtrar intereses según argumentos
-    if args.interests:
-        selected_ids = [x.strip() for x in args.interests.split(",") if x.strip()]
-        interests = [i for i in interests if i["id"] in selected_ids]
-        print(f"Filtrado a {len(interests)} intereses especificados: {selected_ids}")
-        if len(interests) == 0:
-            print("Ninguno de los intereses especificados coincide con los cargados de Supabase.")
-            return
-    else:
-        import random
-        random.shuffle(interests)
-        print(f"Sin intereses específicos solicitados. Procesando aleatoriamente.")
-
-    print(f"\nIniciando recolección de contenido (límite: {args.limit} libros/resúmenes)...")
-    books_generated = 0
-    max_attempts = args.limit * 3  # Previene bucles infinitos si hay errores repetidos o no hay más libros
-    attempts = 0
-    interest_index = 0
-    
-    if not interests:
-        print("No hay intereses para procesar.")
-        return
-        
-    while books_generated < args.limit and attempts < max_attempts:
-        interest = interests[interest_index % len(interests)]
-        interest_id = interest["id"]
-        label = interest["label"]
-        area_id = interest["area_id"]
-        
-        print(f"\n[*] Procesando [{interest_id}] {label} ({area_id}) - Intento {attempts + 1}")
-        
-        # Consultar cuántos libros hay antes de buscar
-        try:
-            res_before = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
-            count_before = res_before.count if res_before.count is not None else 0
-        except Exception:
-            count_before = 0
-            
-        # 1. Buscar libro
-        fetch_book_summaries(interest_id, label)
-        
-        # Consultar cuántos libros hay después de buscar para verificar si se añadió uno nuevo
-        try:
-            res_after = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
-            count_after = res_after.count if res_after.count is not None else 0
-        except Exception:
-            count_after = 0
-            
-        if count_after > count_before:
-            books_generated += 1
-            print(f"    -> Libro generado con éxito ({books_generated}/{args.limit})")
-        else:
-            print("    -> No se generó ningún libro nuevo (posible duplicado o límite alcanzado).")
-            
-        # 2. Buscar personaje (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
-        if attempts < len(interests):
-            fetch_wikipedia_people(interest_id, label)
-        
-        # 3. Buscar artículos (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
-        if attempts < len(interests):
-            fetch_rss_and_devto_articles(interest_id, label, area_id)
-            
-        interest_index += 1
-        attempts += 1
-        
-    print("\n" + "="*60)
-    print(f"¡Recolección completada! Libros generados: {books_generated}/{args.limit} en {attempts} intentos.")
-    print("="*60)
+    run_gather(limit=args.limit, interest_ids=args.interests)
 
 if __name__ == "__main__":
     main()
