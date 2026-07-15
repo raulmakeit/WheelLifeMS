@@ -45,6 +45,30 @@ genai.configure(api_key=GEMINI_API_KEY, transport='rest')
 # Usar gemini-2.5-flash como modelo rápido y gratuito por defecto
 model = genai.GenerativeModel('gemini-2.5-flash')
 
+def clean_markdown_text(text):
+    if not text:
+        return ""
+    cleaned = text.strip()
+    
+    # 1. Quitar saludos conversacionales al inicio de la IA (ej: "¡Claro! Aquí tienes...")
+    cleaned = re.sub(r"^(¡?Claro[!,]?\s+)?(Aquí tienes|Aquí está|Por supuesto[!,]?\s+Aquí tienes|Este es|Claro, aquí).*?:\s*(\n\s*---?\s*\n|\n\n)?", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = cleaned.strip()
+
+    # 2. Match ```markdown ... ```
+    match_md = re.match(r"^```markdown\s+(.*?)\s*```$", cleaned, re.DOTALL | re.IGNORECASE)
+    if match_md:
+        cleaned = match_md.group(1).strip()
+    else:
+        # Match ``` ... ```
+        match_code = re.match(r"^```\s+(.*?)\s*```$", cleaned, re.DOTALL)
+        if match_code:
+            cleaned = match_code.group(1).strip()
+            
+    # 3. Corregir énfasis que envuelven encabezados (ej: *### Título* -> ### *Título*)
+    cleaned = re.sub(r"^(\*|_)+(#{1,6})\s*(.*?)\s*\1+$", r"\2 \1\3\1", cleaned, flags=re.MULTILINE)
+    
+    return cleaned.strip()
+
 # Crear cliente de Supabase con permisos de admin (Bypassing SSL checks)
 try:
     http_client = httpx.Client(verify=False)
@@ -395,11 +419,13 @@ def fetch_book_summaries(interest_id, label):
 
         ---
         ***Resumen interpretativo independiente de "{title}", original de {authors}.***
+
+        IMPORTANTE: Devuelve ÚNICAMENTE el texto en formato Markdown de acuerdo a la estructura anterior. No agregues ninguna frase de introducción o de cierre, ni saludos, ni comentarios conversacionales (como "Claro, aquí tienes...", etc.). Empieza directamente con el título del libro en H1 (# {title}).
         """
         
         print(f"    Generando resumen estructurado con Gemini para: {title}")
         ai_response = model.generate_content(prompt)
-        summary_markdown = ai_response.text
+        summary_markdown = clean_markdown_text(ai_response.text)
         
         # Calcular tiempo de lectura estimado
         words_count = len(summary_markdown.split())
@@ -420,7 +446,6 @@ def fetch_book_summaries(interest_id, label):
                 snippet = f"Lectura: {read_time} • {grand_idea}"
         except Exception as e_regex:
             print(f"    Advertencia al extraer La Gran Idea para el snippet: {e_regex}")
-        
         book_data = {
             "interest_id": interest_id,
             "title": title,
@@ -441,15 +466,60 @@ def fetch_book_summaries(interest_id, label):
 
 def fetch_wikipedia_people(interest_id, label):
     """Busca personajes en Wikipedia y genera una biografía narrativa apasionante con Gemini AI."""
-    print(f"  Buscando personas/conceptos relevantes sobre: {label}")
+    print(f"  Buscando personas relevantes sobre: {label}")
     try:
-        search_url = f"https://es.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(label)}&format=json&utf8=1&origin=*"
-        res = requests.get(search_url, timeout=10, verify=False)
+        # 1. Consultar nombres ya existentes en Supabase para evitar duplicados
+        existing_people = []
+        try:
+            res_exist = supabase.table("people").select("name").eq("interest_id", interest_id).execute()
+            if res_exist.data:
+                existing_people = [p["name"] for p in res_exist.data]
+                print(f"    Personas ya existentes para este interés: {existing_people}")
+        except Exception as e:
+            print(f"    Advertencia al leer personas existentes de Supabase: {e}")
+
+        # Crear cláusula de exclusión si hay existentes
+        exclude_clause = ""
+        if existing_people:
+            exclude_clause = f"\nEvita recomendar o sugerir cualquiera de las siguientes personas que ya están en la base de datos: {', '.join(existing_people)}."
+
+        # 2. Preguntar a Gemini por el personaje histórico o contemporáneo definitivo/más influyente para ese interés
+        recommend_prompt = f"""
+        Dime el nombre de una persona histórica o contemporánea real (líder, científico, filósofo, emprendedor, artista, etc.) que sea la figura más representativa, influyente o inspiradora sobre el tema o interés: "{label}".{exclude_clause}
+        Responde únicamente con el nombre exacto de la persona en una sola línea.
+        Ejemplos:
+        Si el tema es Estoicismo, responde: Séneca
+        Si el tema es Criptomonedas, responde: Satoshi Nakamoto
+        Si el tema es Relatividad, responde: Albert Einstein
+        Si el tema es Liderazgo, responde: Winston Churchill
+        No agregues explicaciones, ni viñetas, ni texto adicional.
+        """
+        
+        print(f"    Pidiendo recomendación de personaje a Gemini para: {label}")
+        rec_res = model.generate_content(recommend_prompt)
+        recommended_name = rec_res.text.strip()
+        # Limpiar posibles comillas o formato que la IA añada
+        recommended_name = clean_markdown_text(recommended_name).replace('"', '').replace("'", "").strip()
+        
+        if not recommended_name or len(recommended_name) < 2 or len(recommended_name) > 60:
+            print(f"    [-] Recomendación inválida recibida: '{recommended_name}'. Buscando directamente por etiqueta.")
+            recommended_name = label
+            
+        print(f"    Personaje recomendado: {recommended_name}")
+
+        # 3. Buscar en Wikipedia por el nombre recomendado
+        wiki_headers = {
+            "User-Agent": "WheelLifeApp/1.0 (https://wheellife.app; contact@wheellife.app) Python/requests"
+        }
+        search_url = f"https://es.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(recommended_name)}&format=json&utf8=1"
+        res = requests.get(search_url, timeout=10, verify=False, headers=wiki_headers)
         if res.status_code != 200:
+            print(f"    [-] Wikipedia rechazó la búsqueda con status {res.status_code} para: {recommended_name}")
             return
             
         search_results = res.json().get("query", {}).get("search", [])
         if not search_results:
+            print(f"    [-] No se encontraron resultados en Wikipedia para: {recommended_name}")
             return
             
         top_page = search_results[0]
@@ -457,15 +527,17 @@ def fetch_wikipedia_people(interest_id, label):
         page_id = top_page.get("pageid")
         wiki_url = f"https://es.wikipedia.org/wiki/{urllib.parse.quote(title)}"
         
-        # Evitar duplicados
+        # Evitar duplicados por URL como fallback final
         existing = supabase.table("people").select("id").eq("url", wiki_url).execute()
         if existing.data:
+            print(f"    [=] La biografía ya existe en la BD por URL: {title} ({wiki_url})")
             return
 
-        # 2. Descargar extracto largo
-        detail_url = f"https://es.wikipedia.org/w/api.php?action=query&prop=extracts|pageimages&exintro=0&explaintext=1&piprop=thumbnail&pithumbsize=300&titles={urllib.parse.quote(title)}&format=json&origin=*"
-        res_detail = requests.get(detail_url, timeout=10, verify=False)
+        # 4. Descargar extracto largo
+        detail_url = f"https://es.wikipedia.org/w/api.php?action=query&prop=extracts|pageimages&exintro=0&explaintext=1&piprop=thumbnail&pithumbsize=300&titles={urllib.parse.quote(title)}&format=json"
+        res_detail = requests.get(detail_url, timeout=10, verify=False, headers=wiki_headers)
         if res_detail.status_code != 200:
+            print(f"    [-] Wikipedia rechazó el detalle con status {res_detail.status_code} para: {title}")
             return
             
         pages = res_detail.json().get("query", {}).get("pages", {})
@@ -478,7 +550,7 @@ def fetch_wikipedia_people(interest_id, label):
         thumbnail = page_info.get("thumbnail", {})
         image_url = thumbnail.get("source") if isinstance(thumbnail, dict) else None
         
-        # Prompt para Gemini
+        # 5. Prompt para Gemini
         prompt = f"""
         Eres un historiador y escritor con gran talento para el storytelling. Escribe una biografía en español sumamente apasionante e inspiradora de "{title}" basada en el siguiente contexto de Wikipedia:
         
@@ -494,11 +566,12 @@ def fetch_wikipedia_people(interest_id, label):
            - Su filosofía clave, legado y por qué su vida es una fuente de inspiración real.
         3. El formato de salida debe ser Markdown limpio y estructurado. Debe comenzar con un título emocionante que resuma su esencia (ej: "# Marco Aurelio: El Emperador Filósofo que Conquistó sus Miedos") y estructurarse con títulos atractivos (usa H2 y H3).
         4. Al final, añade una sección con créditos que mencione: "*Créditos: Basado en registros históricos y contenido público de Wikipedia.*"
+        5. IMPORTANTE: Devuelve ÚNICAMENTE el texto en formato Markdown de acuerdo a las pautas anteriores. No agregues ninguna frase de introducción o de cierre, ni saludos, ni comentarios conversacionales (como "Claro, aquí tienes...", etc.). Empieza directamente con el título de la biografía en H1 (#).
         """
         
         print(f"    Redactando biografía apasionante con Gemini para: {title}")
         ai_response = model.generate_content(prompt)
-        biography_markdown = ai_response.text
+        biography_markdown = clean_markdown_text(ai_response.text)
         
         # Snippet corto de tarjeta
         snippet_preview = f"La apasionante historia de {title} y su impacto en {label}. Descubre sus luchas y su legado."
@@ -513,10 +586,10 @@ def fetch_wikipedia_people(interest_id, label):
             "collected": False
         }
         supabase.table("people").insert(people_data).execute()
-        print(f"    [+] Persona/Concepto guardado con biografía IA: {title}")
+        print(f"    [+] Biografía IA guardada con éxito: {title}")
         
     except Exception as e:
-        print(f"    Error buscando/redactando biografía para {label}: {e}")
+        print(f"    Error buscando/resumiendo biografía de persona para {label}: {e}")
 
 def fetch_rss_and_devto_articles(interest_id, label, area_id):
     """Busca artículos, extrae el texto del cuerpo HTML, y genera un formato Markdown limpio con Gemini AI."""
@@ -611,26 +684,39 @@ def fetch_rss_and_devto_articles(interest_id, label, area_id):
             ----------------------
             
             Instrucciones:
-            1. En la parte superior del artículo, añade un bloque en cursiva de "Resumen Ejecutivo de 1 Minuto" con las 3 conclusiones principales.
+            1. En la parte superior del artículo, añade un título H3 "Resumen Ejecutivo de 1 Minuto", seguido por las 3 conclusiones principales en un bloque en cursiva (no apliques cursiva al título H3, solo a los párrafos/viñetas de las conclusiones).
             2. Adapta el texto original para que sea cómodo de leer: organiza en títulos y subtítulos (H2, H3), usa listas con viñetas para puntos clave y destaca citas relevantes en bloque.
             3. Asegúrate de corregir cualquier error de copiado o formato del texto original.
             4. Al final del artículo, incluye siempre una sección de créditos diciendo: "*Créditos: Este contenido es una adaptación limpia del artículo original publicado en {cand['url']}. Todos los derechos pertenecen a su respectivo autor.*"
+            5. IMPORTANTE: Devuelve ÚNICAMENTE el texto en formato Markdown de acuerdo a las pautas anteriores. No agregues ninguna frase de introducción o de cierre, ni saludos, ni comentarios conversacionales (como "Claro, aquí tienes...", etc.). Empieza directamente con el primer encabezado (ej: "### Resumen Ejecutivo de 1 Minuto" o el título del artículo).
             """
             
             print(f"    Estructurando y resumiendo artículo con Gemini...")
             ai_res = model.generate_content(prompt)
-            article_markdown = ai_res.text
+            article_markdown = clean_markdown_text(ai_res.text)
             
             words_count = len(article_markdown.split())
             read_time_val = max(2, min(10, round(words_count / 200)))
             read_time = f"{read_time_val} min"
             
-            # Recortar snippet para la vista previa de la tarjeta
+            # Generar una vista previa corta y descriptiva específica de este artículo usando Gemini
             snippet = cand["title"]
-            if len(snippet) > 80:
-                snippet = snippet[:77] + "..."
-            else:
-                snippet = f"Lectura recomendada de {read_time}: " + snippet
+            try:
+                snippet_prompt = f"""
+                Genera una única frase corta, descriptiva y atractiva (máximo 120 caracteres) en español que sirva como vista previa/subtítulo para la tarjeta de este artículo en una aplicación móvil.
+                No uses introducciones como "Este artículo..." o "En este artículo...". Empieza directamente describiendo el tema.
+                
+                Título del Artículo: {cand['title']}
+                Contenido del Artículo: {article_markdown[:1500]}
+                """
+                snippet_res = model.generate_content(snippet_prompt)
+                ai_snippet = snippet_res.text.strip().replace('"', '').replace('\n', ' ')
+                if ai_snippet and len(ai_snippet) > 10:
+                    snippet = ai_snippet
+            except Exception as e_snip:
+                print(f"    Advertencia al generar vista previa específica: {e_snip}")
+                if len(snippet) > 80:
+                    snippet = snippet[:77] + "..."
                 
             art_data = {
                 "interest_id": interest_id,
@@ -650,12 +736,22 @@ def fetch_rss_and_devto_articles(interest_id, label, area_id):
         except Exception as e:
             print(f"    Error procesando artículo {cand['url']}: {e}")
 
-def run_gather(limit=3, interest_ids=None):
+def run_gather(limit=3, interest_ids=None, content_types=None):
     global last_error_msg
     last_error_msg = ""
     print("="*60)
     print("WHEELLIFE RSS - RECOLECTOR DE CONTENIDOS CON GEMINI AI")
     print("="*60)
+    
+    # Parsear content_types
+    if content_types:
+        types_list = [x.strip().lower() for x in content_types.split(",") if x.strip()]
+        enabled_types = set(types_list)
+    else:
+        enabled_types = {"books", "articles", "people"}
+        
+    print(f"Módulos de recolección activados: {list(enabled_types)}")
+    
     try:
         init_interests()
         
@@ -680,9 +776,9 @@ def run_gather(limit=3, interest_ids=None):
             random.shuffle(interests)
             print(f"Sin intereses específicos solicitados. Procesando aleatoriamente.")
 
-        print(f"\nIniciando recolección de contenido (límite: {limit} libros/resúmenes)...")
-        books_generated = 0
-        max_attempts = limit * 3  # Previene bucles infinitos si hay errores repetidos o no hay más libros
+        print(f"\nIniciando recolección de contenido (límite: {limit})...")
+        items_generated = 0
+        max_attempts = limit * 5
         attempts = 0
         interest_index = 0
         
@@ -690,7 +786,7 @@ def run_gather(limit=3, interest_ids=None):
             print("No hay intereses para procesar.")
             return
             
-        while books_generated < limit and attempts < max_attempts:
+        while items_generated < limit and attempts < max_attempts:
             interest = interests[interest_index % len(interests)]
             interest_id = interest["id"]
             label = interest["label"]
@@ -698,46 +794,81 @@ def run_gather(limit=3, interest_ids=None):
             
             print(f"\n[*] Procesando [{interest_id}] {label} ({area_id}) - Intento {attempts + 1}")
             
-            # Consultar cuántos libros hay antes de buscar
-            try:
-                res_before = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
-                count_before = res_before.count if res_before.count is not None else 0
-            except Exception:
-                count_before = 0
+            # 1. Buscar libro (si está habilitado)
+            if "books" in enabled_types and items_generated < limit:
+                try:
+                    res_before = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_before = res_before.count if res_before.count is not None else 0
+                except Exception:
+                    count_before = 0
+                    
+                fetch_book_summaries(interest_id, label)
                 
-            # 1. Buscar libro
-            fetch_book_summaries(interest_id, label)
-            
-            # Consultar cuántos libros hay después de buscar para verificar si se añadió uno nuevo
-            try:
-                res_after = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
-                count_after = res_after.count if res_after.count is not None else 0
-            except Exception:
-                count_after = 0
+                try:
+                    res_after = supabase.table("books").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_after = res_after.count if res_after.count is not None else 0
+                except Exception:
+                    count_after = 0
+                    
+                if count_after > count_before:
+                    items_generated += 1
+                    print(f"    -> Libro generado con éxito ({items_generated}/{limit})")
+                else:
+                    print("    -> No se generó ningún libro nuevo (posible duplicado).")
                 
-            if count_after > count_before:
-                books_generated += 1
-                print(f"    -> Libro generado con éxito ({books_generated}/{limit})")
-            else:
-                print("    -> No se generó ningún libro nuevo (posible duplicado o límite alcanzado).")
-                
-            # 2. Buscar personaje (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
-            if attempts < len(interests):
+            # 2. Buscar personaje (si está habilitado)
+            if "people" in enabled_types and items_generated < limit:
+                try:
+                    res_before = supabase.table("people").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_before = res_before.count if res_before.count is not None else 0
+                except Exception:
+                    count_before = 0
+                    
                 fetch_wikipedia_people(interest_id, label)
-            
-            # 3. Buscar artículos (sólo la primera vez para este interés para evitar llamadas repetidas redundantes)
-            if attempts < len(interests):
-                fetch_rss_and_devto_articles(interest_id, label, area_id)
                 
+                try:
+                    res_after = supabase.table("people").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_after = res_after.count if res_after.count is not None else 0
+                except Exception:
+                    count_after = 0
+                    
+                if count_after > count_before:
+                    items_generated += 1
+                    print(f"    -> Biografía generada con éxito ({items_generated}/{limit})")
+                else:
+                    print("    -> No se generó ninguna biografía nueva (posible duplicado).")
+                
+            # 3. Buscar artículos (si está habilitado)
+            if "articles" in enabled_types and items_generated < limit:
+                try:
+                    res_before = supabase.table("articles").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_before = res_before.count if res_before.count is not None else 0
+                except Exception:
+                    count_before = 0
+
+                fetch_rss_and_devto_articles(interest_id, label, area_id)
+
+                try:
+                    res_after = supabase.table("articles").select("id", count="exact").eq("interest_id", interest_id).execute()
+                    count_after = res_after.count if res_after.count is not None else 0
+                except Exception:
+                    count_after = 0
+
+                if count_after > count_before:
+                    items_generated += 1
+                    print(f"    -> Artículo generado con éxito ({items_generated}/{limit})")
+                else:
+                    print("    -> No se generó ningún artículo nuevo (posible duplicado).")
+
             interest_index += 1
             attempts += 1
             
         print("\n" + "="*60)
-        print(f"¡Recolección completada! Libros generados: {books_generated}/{limit} en {attempts} intentos.")
+        print(f"¡Recolección completada! Elementos generados: {items_generated}/{limit} en {attempts} intentos.")
         print("="*60)
     finally:
         try:
-            if books_generated == 0 and last_error_msg:
+            if items_generated == 0 and last_error_msg:
                 if "429" in last_error_msg or "Quota exceeded" in last_error_msg:
                     friendly_error = "Se ha superado el límite de uso de la Inteligencia Artificial. Por favor, espera aproximadamente un minuto e inténtalo de nuevo."
                 elif "Max retries exceeded" in last_error_msg:
@@ -745,8 +876,14 @@ def run_gather(limit=3, interest_ids=None):
                 else:
                     friendly_error = "Ocurrió un error inesperado generando el resumen. Inténtalo de nuevo más tarde."
                 final_result = f"Error: {friendly_error}"
+            elif "books" not in enabled_types and items_generated == 0 and last_error_msg:
+                if "429" in last_error_msg or "Quota exceeded" in last_error_msg:
+                    friendly_error = "Se ha superado el límite de uso de la Inteligencia Artificial. Por favor, espera aproximadamente un minuto e inténtalo de nuevo."
+                else:
+                    friendly_error = "Ocurrió un error inesperado. Inténtalo de nuevo más tarde."
+                final_result = f"Error: {friendly_error}"
             else:
-                final_result = f"Éxito: Se generaron {books_generated} libros."
+                final_result = f"Éxito: Se generaron {items_generated} elemento(s) de contenido."
                 
             supabase.table("system_settings").upsert({"key": "scraping_last_error", "value": final_result}).execute()
             supabase.table("system_settings").upsert({"key": "scraping_status", "value": "idle"}).execute()
@@ -756,10 +893,11 @@ def run_gather(limit=3, interest_ids=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--limit', type=int, default=3, help="Límite de libros a generar en total")
+    parser.add_argument('--limit', type=int, default=3, help="Límite de libros/elementos a generar en total")
     parser.add_argument('--interests', type=str, default=None, help="Lista de IDs de intereses separados por coma")
+    parser.add_argument('--content_types', type=str, default=None, help="Tipos de contenido separados por coma (books,articles,people)")
     args = parser.parse_args()
-    run_gather(limit=args.limit, interest_ids=args.interests)
+    run_gather(limit=args.limit, interest_ids=args.interests, content_types=args.content_types)
 
 if __name__ == "__main__":
     main()

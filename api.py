@@ -32,6 +32,7 @@ def gather_data():
     data = request.json or {}
     limit = data.get("limit", 3)
     interests = data.get("interests", None)
+    content_types = data.get("contentTypes", None)
     
     if interests and isinstance(interests, list):
         interests_str = ",".join(interests)
@@ -39,6 +40,13 @@ def gather_data():
         interests_str = interests
     else:
         interests_str = None
+        
+    if content_types and isinstance(content_types, list):
+        content_types_str = ",".join(content_types)
+    elif content_types and isinstance(content_types, str):
+        content_types_str = content_types
+    else:
+        content_types_str = None
         
     try:
         # Poner status en in_progress ANTES de responder al cliente
@@ -49,7 +57,7 @@ def gather_data():
         print(f"Advertencia: No se pudo actualizar status inicial en Supabase: {e}")
         
     # Iniciar la recolección en segundo plano (Fire and Forget)
-    thread = threading.Thread(target=run_gather, args=(limit, interests_str))
+    thread = threading.Thread(target=run_gather, args=(limit, interests_str, content_types_str))
     thread.daemon = True
     thread.start()
     
