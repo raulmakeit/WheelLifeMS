@@ -33,6 +33,7 @@ def gather_data():
     limit = data.get("limit", 3)
     interests = data.get("interests", None)
     content_types = data.get("contentTypes", None)
+    limits_config = data.get("limitsConfig", None)
     
     if interests and isinstance(interests, list):
         interests_str = ",".join(interests)
@@ -47,23 +48,19 @@ def gather_data():
         content_types_str = content_types
     else:
         content_types_str = None
-        
+
+    # Anexar nueva Orden a la cola JSON en Supabase
     try:
-        # Poner status en in_progress ANTES de responder al cliente
-        supabase.table("system_settings").upsert(
-            {"key": "scraping_status", "value": "in_progress"}
-        ).execute()
+        from main import append_order_to_queue, start_worker_if_needed
+        new_order = append_order_to_queue(interests_str, content_types_str, limits_config, limit)
+        start_worker_if_needed()
     except Exception as e:
-        print(f"Advertencia: No se pudo actualizar status inicial en Supabase: {e}")
+        print(f"Error al encolar orden: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
         
-    # Iniciar la recolección en segundo plano (Fire and Forget)
-    thread = threading.Thread(target=run_gather, args=(limit, interests_str, content_types_str))
-    thread.daemon = True
-    thread.start()
-    
     return jsonify({
         "success": True, 
-        "message": "Recolección iniciada en segundo plano"
+        "message": f"Orden {new_order.get('order_id')} añadida a la cola."
     })
 
 if __name__ == "__main__":
